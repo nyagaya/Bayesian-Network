@@ -1,0 +1,345 @@
+---
+title: "Bayesian Network"
+output: github_document
+---
+http://blog.revolutionanalytics.com/2015/10/the-5th-tribe-support-vector-machines-and-caret.html
+
+**An Application to Mental Health in Tech Survey Data**
+
+**By Collins Nyagaya**
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+This analysis is divided into five sections:
+
+* **Introduction** - define business case, introduce data, and briefly discuss implemented machine learning techniques.
+* **Data preprocessing** - discusses preprocessing techniques implemented - handling missing values, imputation, detecting outliers, data reduction/transformation, and data munging etc.
+* **Data Analysis** - exploratory data analysis - we answer some questions of interest via visualizations and provide detailed inferences.
+* **Modeling** - we construct network structure, fit parameters and validate model
+* **Demonstration** - we demonstrate how to query the network to predict event probabilities based on conditional evidence.
+
+
+### Introduction
+
+Generally, the goal of survey data is to provide stakeholders with compact understanding of problems at hand. However, with the high dimensional nature of survey data, summarization and visualizations are not typically the optimal ways to present this data type. Probabilistic graphical models, specifically Bayesian networks, are a powerful alternative for this data, where upon the constructed network can be queried in multi ways **based on observed evidence to predict any of the variables in the data **. The task at hand is to demonstrate, at a high level, the steps in constructing, validating, and querying a Bayesian network. We use the mental health in tech survey data from Kaggle - https://www.kaggle.com/osmi/mental-health-in-tech-survey. This 2014 survey measured attitudes towards mental health and frequency of mental health disorders in the tech workplace. It was conducted in 2014 with nearly one third of the respondents outside the United States. There were 1,300 respondents/cases with 26 variables. Through the Bayesian network, we hope to derive key understanding around mental health issues in the technology industries.
+
+
+```{r Libraries, message=FALSE, warning=FALSE, results='hide'}
+# load libraries
+libs <- c("bnlearn", "graph", "Rgraphviz", "data.table", "missForest", 
+           "dplyr", "ggplot2", "reshape2", "ggthemes", "tidyr", "stringr",
+          "magrittr", "tidyverse", "knitr")
+lapply(libs, require, character.only = TRUE)
+```
+
+
+```{r pressure, echo=FALSE, results="hide"}
+mental <- read.csv("survey.csv", stringsAsFactors = TRUE)
+
+names(mental) <- c("Timestamp", "Age", "Gender", "Country", "State",
+           "S_Emp", "F_Hist", "Trmt", "W_Intef", "N_Empl",
+           "Re_Wrk", "Tk_Comp", "Bfts", "Cr_Opt", "W_Pgrm",
+           "Sk_Help", "Anony", "Leave", "MHCon", "PHCon",
+           "C_Wrks", "Spvrs", "MH_Int", "PH_Int", "MHvPH",
+           "Ob_Cons", "Comments")
+
+str(mental)
+```
+
+```{r}
+# data view
+str(mental)
+```
+
+
+### Data Preprocessing
+
+Missing data search shows the presence of missing values - with action items as below. The imputed variables were central to the task at hand. 
+
+* State - nearly 50% missing values - removed!
+* Comments - 90% missing values - removed!
+* Self-employed - 1% missing values missing - imputed
+* Work Interference - 20% missing values - imputed
+* Gender - factor with 49 levels - we performed gender unification to three levels [male, female, transgender]
+* Age - many unusual ages (-29, -1726, -1) and 5, 8, 11, 329, and 99billion. We replaced these with the median age (excluding the above) == 31
+
+
+```{r}
+# any missing values?
+colSums(is.na(mental))
+# gender unification
+mental %<>% dplyr::select(-c(Comments, State, Timestamp))
+mental$Gender %<>% str_to_lower()
+
+male_str <- c("male", "m", "male-ish", "maile", "mal", "male (cis)", "make", "male ",
+              "man","msle", "mail", "malr","cis man", "cis male")
+trans_str <- c("trans-female", "something kinda male?", "queer/she/they", "non-binary",
+               "nah", "all", "enby", "fluid", "genderqueer", "androgyne", "agender",
+               "male leaning androgynous", "guy (-ish) ^_^", "trans woman", "neuter", 
+               "female (trans)", "queer", "ostensibly male, unsure what that really means",
+               "a little about you", "guy (-ish) ^_^", "p")
+female_str <- c("cis female", "f", "female", "woman",  "femake", "female ",
+                "cis-female/femme", "female (cis)", "femail")
+
+mental$Gender <- sapply(as.vector(mental$Gender), function(x) if(x %in% male_str) "Male" else x )
+mental$Gender <- sapply(as.vector(mental$Gender), function(x) if(x %in% female_str) "Female" else x )
+mental$Gender <- sapply(as.vector(mental$Gender), function(x) if(x %in% trans_str) "Trans" else x )
+mental$Gender <- as.factor(mental$Gender)
+
+# treating the unsual age ranges
+mental$Age[mental$Age %in% c(-29, -1726, -1, 5, 8, 11, 329, 99999999999)] <- 31
+mental$Age <- as.numeric(mental$Age)
+```
+
+
+Variables self-employed and work interference had 18 and 264 missing data points respectively. Imputation was performed via missForest package as it has capability to handle mixed type data very well. In terms of the out of bag imputation error measurements, the proportion of falsely classified (PFC) - was 2.7 percent. Note - We did not place significant effort in optimally tuning the imputation process.
+
+```{r, cache=TRUE, results="hide"}
+require(missForest)
+set.seed(529)
+mh.combi <- missForest(mental, ntree = 1000, mtry = 5)
+mental.imp <- mh.combi$ximp
+mh.combi$OOBerror
+```
+```{r}
+mh.combi$OOBerror
+```
+
+
+### Data Analysis
+
+Exploratory data analysis (EDA) is a powerful intuitive way to answer questions or queries we have about a data set. A few questions we hope to answer through visualizations to the Bayesian network include:
+
+* How many women vs. men are in tech and which groups are seeking mental health treatment
+* How does location of work (remote or office) play into mental health challenges
+* How is mental health viewed in the different geographies, by gender, state, country etc.
+* General perceptions of mental health from colleagues, superiors and its impacts
+
+The histogram shows age distribution of the tech workers, with a slight right skewness. Youngest tech worker was 18 while the oldest 72 and an overall median age of 31. Nearly 75 percent of participants were under 36, while majority were between 20 - 50, with far larger concentration in the 23 - 43 age bracket. We noted possible outlier past age 62 though we do not perform outlier treatment here. In addition, six participants were aged over 60. 
+
+```{r, echo=FALSE}
+ggplot(data = mental) +
+  geom_histogram(mapping =  aes(x=Age), binwidth = 3) +
+  labs(
+    title = paste(
+      "Age Distribution of Tech Workers"
+    ),
+    subtitle = paste(
+      "Distribution does not follow gaussian distribution - more right skewed with possible outliers"
+    ),
+    caption = "2014 Tech Survey"
+  ) +
+  theme_bw()
+```
+
+General perception is tech is dominated by men. The box plot shows 79 percent of participants were male, 20 percent female and 1 percent Transgender. Females have a lower median age (30) compared males (32) and most women are aged between 18 and 47. Alternatively, there are many men aged over 50 - meaning in general, women in tech tend to be younger compared to men. The max age of 72 is female while nearly all Transgender participants are under age 31. 
+
+
+```{r, echo=FALSE, results="hide"}
+ggplot(data = mental) +
+  geom_boxplot(mapping = aes(x=Gender, y=Age)) +
+  coord_flip() +
+  labs(
+    title = paste(
+      "Age by Gender"
+    ),
+    subtitle = paste(
+      "Women are significantly fewer in Tech and much younger compared to men"
+    ),
+    caption = "2014 Tech Survey"
+  ) +
+  theme_bw()
+
+prop.table(table(mental.imp$Gender))
+```
+
+
+Who is seeking mental health services? We know women are fewer in tech compared to men, however, a significant number, 69 percent of women sought mental health treatment compared to men at 46 percent. Transgenders appear to be seeking mental health services in significant numbers at 81 percent. 
+
+```{r, echo=FALSE, results="hide"}
+ggplot(data = mental) + 
+  geom_count(mapping = aes(x=Gender, y=Trmt)) +
+  coord_flip() +
+  labs(
+    title = paste(
+      "Mental Health Treatment by Gender"
+    ),
+    subtitle = paste(
+      "Significant majority of women sought mental health services"
+    ),
+    caption = "2014 Tech Survey"
+  ) +
+  theme_bw()
+
+round(prop.table(table(mental.imp$Gender, mental.imp$Trmt)),2)
+```
+
+
+Other interesting observations: 
+
+Majority of tech workers are either based in the US, UK or Canada with most of those seeking mental health services reside within the three countries as well. Nearly all Transgender categories reside either in the US or UK. Lastly, there are a host of other questions we could answer with visualizations. However, as the task is to construct a Bayesian network, most, if not all, of these questions will be answered via queries to the Bayesian network.
+
+```{r, echo=FALSE}
+ggplot(data = mental) +
+  geom_count(mapping = aes(x=Country, y=Trmt)) +
+  coord_flip() +
+  ggtitle("Mental Health Treatment by Geography") +
+  theme_bw()
+```
+
+
+```{r, echo=FALSE}
+ggplot(data = mental) +
+  geom_count(mapping = aes(x=Country, y=Gender)) +
+  coord_flip() +
+  ggtitle("Gender Distribution by Geography") +
+  theme_bw()
+```
+
+### Modeling
+
+Though variable discretization is never a great solution due to information loss, for demonstration and better model handling, we discretized variable Age. We split data into a training set - 85 percent, and validation set - 15 percent. Validation set was the unseen data to validate model's generalizability via 10-fold cross validation. We also computed the log-likelihood loss function which would have served as the model selection criteria were we to compare different models.
+
+```{r, echo=FALSE}
+mental.imp$Age <- mental$Age
+mental.imp$Age <- cut(mental.imp$Age, seq(0, 80, 15))
+summary(mental.imp$Age)
+
+set.seed(0210)
+ind <- sample(2, nrow(mental.imp), replace = TRUE, prob = c(0.85, 0.15))
+training <- mental.imp[ind==1,]
+validation <- mental.imp[ind==2,]
+
+```
+
+
+#### Bayesian Network structure learning
+
+Constructing a Bayesian network is a two-step process. First, we learn the network structure followed by parameter estimation. For this task, we train one constraint-based algorithm - Fast Incremental Association Markov Blanket (fast.iamb). Constraint-based algorithms are powerful and achieve robust results by analyzing the probabilistic relations entailed by the Markov blanket property using speculative stepwise forward selection to reduce the number of conditional independence test. 
+
+Network structure - The learned network had 24 nodes, 26 arcs - 17 directed and 9 undirected arc due to score equivalency and an average Markov blanket of 3.2. To complete the network structure, Using the algorithmic search function, we performed best arc direction fit for the undirected arcs. In addition, one network node had no arcs, so we manually removed it.
+ 
+
+```{r, warning=FALSE, message=FALSE, include=FALSE}
+set.seed(0210)
+bn.1 <- fast.iamb(training, test = "mi", optimized = TRUE, 
+                  undirected = FALSE, debug = TRUE)
+
+```
+
+
+```{r}
+configs(mental.imp, all = TRUE)
+```
+
+
+```{r}
+bn.1
+graphviz.plot(bn.1)
+```
+
+
+```{r, echo=TRUE, warning=FALSE, message=FALSE, results="hide"}
+bn.1$arcs
+
+choose.direction(bn.1, training, arc = c("Re_Wrk", "S_Emp"), criterion = "aic", debug = TRUE)
+bn.1 <- set.arc(bn.1, "S_Emp", "Re_Wrk")
+choose.direction(bn.1, training, arc = c("Re_Wrk", "Age"), criterion = "aic", debug = TRUE)
+bn.1 <- set.arc(bn.1, "Re_Wrk", "Age")
+choose.direction(bn.1, training, arc = c("Trmt", "F_Hist"), criterion = "aic", debug = TRUE)
+bn.1 <- set.arc(bn.1, "Trmt", "F_Hist")
+choose.direction(bn.1, training, arc = c("Trmt", "W_Intef"), criterion = "aic", debug = TRUE)
+bn.1 <- set.arc(bn.1, "Trmt", "W_Intef")
+choose.direction(bn.1, training, arc = c("W_Intef", "F_Hist"), criterion = "aic", debug = TRUE)
+bn.1 <- set.arc(bn.1, "W_Intef", "F_Hist")
+choose.direction(bn.1, training, arc = c("W_Intef", "Leave"), criterion = "aic", debug = TRUE)
+bn.1 <- set.arc(bn.1, "W_Intef", "Leave")
+choose.direction(bn.1, training, arc = c("S_Emp", "Leave"), criterion = "aic", debug = TRUE)
+bn.1 <- set.arc(bn.1, "S_Emp", "Leave")
+choose.direction(bn.1, training, arc = c("S_Emp", "N_Empl"), criterion = "aic", debug = TRUE)
+bn.1 <- set.arc(bn.1, "S_Emp", "N_Empl")
+choose.direction(bn.1, training, arc = c("MHvPH", "W_Pgrm"), criterion = "aic", debug = TRUE)
+bn.1 <- set.arc(bn.1, "MHvPH", "W_Pgrm")
+choose.direction(bn.1, training, arc = c("MHCon", "W_Intef"), criterion = "aic", debug = TRUE)
+bn.1 <- set.arc(bn.1, "W_Intef", "MHCon")
+```
+
+Completely Directed network
+
+```{r}
+graphviz.plot(bn.1)
+```
+
+##### Final Network Structure
+
+```{r}
+modelstring(bn.1)
+
+bn.1.string <- "[Gender][S_Emp][Trmt][Tk_Comp][C_Wrks][MH_Int][MHvPH][W_Intef|Trmt][N_Empl|S_Emp][Re_Wrk|S_Emp][W_Pgrm|MHvPH][Age|Re_Wrk][F_Hist|Trmt:W_Intef][Leave|S_Emp:W_Intef][MHCon|W_Intef][Bfts|Gender:F_Hist:N_Empl:Tk_Comp][Anony|Leave:MHvPH][Spvrs|MHCon:C_Wrks][Country|Bfts][Cr_Opt|Anony][PHCon|MHCon:Spvrs][Sk_Help|N_Empl:Cr_Opt:W_Pgrm][PH_Int|PHCon:MH_Int]"
+
+bn.1.final <- model2network(bn.1.string)
+graphviz.plot(bn.1.final)
+bn.1.final
+modelstring(bn.1.final)
+```
+
+
+#### Parameter Fitting
+
+With a completely directed network structure, we fit parameters - conditional probability tables for each node. Two widely used approaches for estimating parameters are the maximum likelihood and Bayesian approach. In this task, we use the Bayesian estimation. We validate the network using 10-fold cross validation on the unseen validation set. On the validation set, the network has log-loss of 20.35
+
+
+```{r, echo=TRUE, results="hide", warning=FALSE, message=FALSE}
+set.seed(0210)
+fit.bn.1 <- bn.fit(bn.1.final, keep.fitted = TRUE, data = training[-24],
+                   method = "bayes")
+fit.bn.1
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+set.seed(0210)
+bn.1.cv <- bn.cv(validation[-24], bn.1.final,
+                 fit = "bayes", method = "k-fold", debug = FALSE)
+bn.1.cv
+```
+
+
+
+### Network Querying
+
+With a completely directed network and parameter estimation complete, we can proceed and query the network. 
+
+What is the probability that a participant sought mental health treatment given evidence that they were aged less than 30 and were aware of the mental health care options provided by their employer?
+
+```{r}
+set.seed(0210)
+cpquery(fit.bn.1, event = (Trmt =="Yes"), evidence = (Cr_Opt == "Yes" & Age == "(60,75]"))
+```
+
+
+What is the probability a tech worker who is aware of the mental health care options provided by an employer has sought treatment for mental health?
+
+```{r}
+set.seed(0210)
+cpquery(fit.bn.1, event = (Trmt=="Yes"), evidence = (Cr_Opt =="Yes"))
+```
+
+What is the probability a transgender participant who is aware of care options provided by the employer is seeking mental health services?
+
+```{r}
+set.seed(0210)
+cpquery(fit.bn.1, event = (Trmt =="Yes"), evidence = (Cr_Opt == "Yes" & Gender == "Trans"))
+```
+
+What is the probability a survey participant who believes there are negative consequences to discussing mental health with an employer would ever discuss their MH during a job interview?
+
+```{r}
+set.seed(0210)
+cpquery(fit.bn.1, event = (MH_Int=="Yes"), evidence = (MHCon =="Yes" & PHCon == "Yes"))
+```
+
+## Conclusion
+
+In this analysis, we showed basic steps of exploratory data analysis, data preprocessing techniques, constructing a Bayesian network and making inferences/queries to the network. For demonstration, we focused on the Fast-IAMB approach. Future work will review other algorithms such as the Min-Max Hill Climbing - which are grid search based, as well as other variants of IAMB (iamb/inter-iamb). In terms of network queries, we showed how a Bayesian is robust in handling survey data set to provide stakeholders with quick predictions based on multi-evidence combinations. In addition, with a Bayesian network, prediction is not focused on one class/variable of interest - rather we can essentially predict the probability of any variable in the network, based on evidence which is a powerful approach to machine learning.
